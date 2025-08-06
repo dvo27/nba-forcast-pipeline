@@ -1,0 +1,9 @@
+snscrape
+yfinance
+pandas
+nltk
+scikit-learn
+statsmodels
+streamlit
+schedule
+sqlalchemy
