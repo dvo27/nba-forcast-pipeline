@@ -1,9 +1,4 @@
-snscrape
-yfinance
+praw
+nba_api
 pandas
 nltk
-scikit-learn
-statsmodels
-streamlit
-schedule
-sqlalchemy

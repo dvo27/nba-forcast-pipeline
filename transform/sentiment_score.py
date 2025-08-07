@@ -1,0 +1,1 @@
+# Apply VADER sentiment scoring
