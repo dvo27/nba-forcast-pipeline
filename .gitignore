@@ -17,8 +17,8 @@ data/processed/
 .vscode/
 .idea/
 
-# Streamlit's cache
-.streamlit/
-
 # Logs
 *.log
+
+# Secrets
+.env

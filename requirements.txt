@@ -2,3 +2,5 @@ praw
 nba_api
 pandas
 nltk
+numpy
+requests
