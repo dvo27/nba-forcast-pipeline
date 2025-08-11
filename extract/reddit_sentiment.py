@@ -1,21 +1,48 @@
 """ Fetches relevent Reddit posts & comments and returns a Pandas DataFrame of them"""
 
 import os
+import time
 import pandas as pd
 import praw
 from dotenv import load_dotenv
 
+"""
+Policy: 
+We use top-sorted, top-level comments only; we do not fully expand threads in v1. 
+This emphasizes stable, high-signal comments and keeps scraping lightweight.
+
+Logging: 
+Per thread: top-level available, kept after cap, skipped deleted/removed.
+
+Notes:
+    - Every kept row is top-level comment (not a reply), sorted by “top,” and comment_rank ≤ comment_limit.
+    - No replies included; no deleted/removed/AutoModerator included.
+    - Extractor runs end-to-end and writes posts_<run_ts>.csv + comments_<run_ts>.csv.
+"""
+
+# Potential TODO:
+# - Expand to replies if we dont have enough top-level comments to reach comment_limit
+
 # Load our keys from .env file
 load_dotenv()
 
-def fetch_reddit_sentiment(subreddit: str, keywords: list[str], limit: int = 50) -> pd.DataFrame:
+
+def fetch_reddit_sentiment(subreddit: str, query: str, post_limit: int = None, comment_limit: int = 150) -> pd.DataFrame:
     """
     - Connects to Reddit via PRAW
-    - Pull top `limit` posts from r/{NBA}.
-    - Filter posts whose title or body mention any of `keywords`.
-    - For each, extract: post_id, created_utc, score, num_comments, title, selftext.
-    - Return a DataFrame.
+    - Pulls top "Game Thread" posts from r/{NBA} within the last year
+    - For each post, extract submission data
+    - If post is within the 2024-2025 NBA Playoffs duration, then we collect the comment data
+    - Return a DataFrame containing comment data of Game Thread posts during the playoff duration
     """
+    
+    # Run Timestamp
+    run_ts = int(time.time())
+    
+
+    total_post_count = 0    # Total Posts Counted
+    valid_post_count = 0
+    
 
     # Initialize PRAW reddit object with our credentials
     reddit = praw.Reddit(
@@ -25,27 +52,144 @@ def fetch_reddit_sentiment(subreddit: str, keywords: list[str], limit: int = 50)
     )
 
     # Get the PRAW subreddit object with our desired subreddit, in this case r/NBA
-    subreddit = reddit.subreddit(subreddit)
+    parsed_subreddit = reddit.subreddit(subreddit)
 
-    # Create a temp array to hold all our submission data
-    all_rows_data = []
+    # Create a temp arrays to hold all our data
+    raw_submissions = []
+    comment_rows = []
 
-    # Collect top 50 comments of posts that are of game threads within the last month
-    # If post has less than 50 comments, just take all comments
+    # NBA Playoff Duration Start: (Apr 19, 2025 00:00:00 UTC)
+    start_utc = 1745020800
 
-    # Get posts that contain 'Game Thread' in the title, sorted by num of comments, within the last month
-    for submission in subreddit.search(keywords, sort="comments", time_filter="month"):
-        submission_data = {'gameID': submission.id,
+    # NBA Playoff Duration End:  (Jun 23, 2025 23:59:59 UTC)
+    end_utc = 1750723199
+
+    # Get posts that contain 'Game Thread' in the title, sorted by num of comments, within the last year,
+    # which then we filter for posts during 2025 NBA PLayoff duration (4/19-6/23)
+    for submission in parsed_subreddit.search(query, sort="comments", limit=post_limit, time_filter="year"):
+        # Save submission data before we work on its comments
+        submission_data = {'post_id': submission.id,
+                           'permalink': submission.permalink,
                            'title': submission.title,
-                           'numComments': submission.num_comments,
-                           'top50Comments': [comment.body for comment in submission.comments[:limit]]}
-        all_rows_data.append(submission_data)
+                           'created_utc': int(submission.created_utc),
+                           'score': submission.score,
+                           'num_comments': submission.num_comments,
+                           'thread_type': 'game',
+                           'query_used': query,
+                           'run_ts': run_ts,
+                           'comment_limit': comment_limit,
+                           'post_limit': post_limit,
+                           'window_start_utc': start_utc,
+                           'window_end_utc': end_utc,
+                           'subreddit': subreddit,
+                           }
+        # Check whether post is within playoff duration before proceeding and save result
+        in_window = start_utc <= int(submission.created_utc) <= end_utc
+        submission_data['in_window'] = in_window
 
-    # Create DF with our submission data
-    submission_df = pd.DataFrame(all_rows_data)
+        # Save minimum metadata about submission regardless if post is in window or not
+        raw_submissions.append(submission_data)
+        post_row = submission_data  # <-- keep this reference so we can update metrics later
+        
+        total_post_count += 1   # Increment number of saved posts for log
 
-    return submission_df
+        try:
+            # If submission is in valid window, then we can parse its comments
+            if in_window:
+                
+                # Increment num of valid posts scraped
+                valid_post_count += 1
+                
+                # Keep track of comment's timestamp for later processing
+                t0 = time.time()
+
+                # sort and strip placeholders (top-level only; no replies)
+                submission.comment_sort = "top"
+                submission.comments.replace_more(limit=0)
+                
+                # Per-thread counters
+                top_level_available = len(submission.comments)  # after limit=0 this is all root comments
+                kept_count = 0
+                skipped_deleted_removed = 0
+                skipped_automoderator = 0
+                skipped_blank = 0
+                
+                # Manually assigning comment ranks to know when to stop
+                comment_rank = 1
+
+                # Loop over comments per post
+                for comment in submission.comments:
+                    # Make sure we don't count invalid comments: removed, deleted, autogenerated, blank
+                    body = (comment.body or "")
+                    author_name = comment.author.name if comment.author else None
+                    
+                    if comment.body in ['[deleted]', '[removed]']:
+                        skipped_deleted_removed += 1
+                        continue
+                    if not body.strip():
+                        skipped_blank += 1
+                        continue
+                    if author_name == 'AutoModerator':
+                        skipped_automoderator += 1
+                        continue
+                    
+                    # Make sure we're only scraping comments within our desired limit
+                    if comment_rank > comment_limit:
+                        # We hit our comment scrape limit; stop
+                        stopped_reason = 'limit_reached'
+                        break
+
+                    # Save comment metadata
+                    comment_data = {'comment_id': comment.id,
+                                    'comment_created_utc': int(comment.created_utc),
+                                    'body': comment.body,
+                                    'comment_score': comment.score,
+                                    'author': author_name,
+                                    'is_top_level': True,
+                                    'comment_rank': comment_rank,
+                                    'comment_sort': submission.comment_sort
+                                    }
+                    
+                    # Add the post's metadata along to each comment row
+                    comment_data.update(post_row)
+                    
+                    # Add our comment + post data row to comment rows temp array
+                    comment_rows.append(comment_data)
+                    
+                    # Update our kept comment count and our current comment's rank
+                    kept_count += 1
+                    comment_rank += 1
+                else:
+                    # Loop ended without break, we've exhausted through our top-level comments
+                    stopped_reason = "exhausted"
+                
+                # write per-thread metrics back onto the same dict we appended earlier
+                post_row["top_level_available"] = top_level_available
+                post_row["kept_count"] = kept_count
+                post_row["skipped_deleted_removed"] = skipped_deleted_removed
+                post_row["skipped_automoderator"] = skipped_automoderator
+                post_row["skipped_blank"] = skipped_blank
+                post_row["stopped_reason"] = stopped_reason
+                post_row["processing_ms"] = int((time.time() - t0) * 1000)
+
+        except Exception as e:
+            # log and continue; don’t crash the whole run
+            print(
+                f"[warn] skipping post {getattr(submission, 'id', '?')}: {e}")
+
+        # Make sure we're not scraping posts too quickly
+        time.sleep(.25)
+
+    # Create comment_DF with our valid post's comment and post metadata while dropping duplicate comments
+    comment_df = pd.DataFrame(comment_rows).drop_duplicates(subset=['comment_id'])
+
+    # Create submission_DF to keep track of the valid post's data we've scraped
+    submission_df = pd.DataFrame(raw_submissions)
+
+    # Write to comment data to CSV...
+
+    return comment_df
 
 
 if __name__ == '__main__':
-    print(fetch_reddit_sentiment('nba', 'Game Thread').head())
+    print(fetch_reddit_sentiment('nba', 'title:"Game Thread"', 3, 20))

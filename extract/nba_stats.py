@@ -1,5 +1,6 @@
 # Fetch game stats & attendance via nba_api
 import pandas as pd
+from nba_api.stats.endpoints import boxscoretraditionalv3
 
 def fetch_nba_stats(season: str) -> pd.DataFrame:
     """
